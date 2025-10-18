@@ -18,11 +18,26 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Get API keys from environment variables
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Allow overriding the model from env; default to a supported model from ListModels output
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+// Normalize so SDK receives the full resource name (models/...) — user can provide either form
+const NORMALIZED_GEMINI_MODEL = GEMINI_MODEL.startsWith('models/') ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
 
-// Initialize Gemini
+if (!GEMINI_API_KEY) {
+  console.warn('Warning: GEMINI_API_KEY is not set. Requests to the Generative AI API will fail.');
+}
+
+// Initialize Gemini client
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+let model;
+try {
+  model = genAI.getGenerativeModel({ model: NORMALIZED_GEMINI_MODEL });
+} catch (err) {
+  // Defensive: if SDK throws during model creation, log the error and rethrow so startup fails fast
+  console.error(`Failed to initialize generative model '${NORMALIZED_GEMINI_MODEL}':`, err);
+  throw err;
+}
 
 // Middleware
 app.use(cors()); // Allow requests from your React frontend
@@ -53,8 +68,65 @@ app.post('/generate-post', upload.single('image'), async (req, res) => {
       },
     };
     
-    const result = await model.generateContent([prompt, imagePart]);
-    const generatedCaption = result.response.text();
+    let result;
+    try {
+      result = await model.generateContent([prompt, imagePart]);
+    } catch (err) {
+      console.error('GenerateContent error:', err);
+      // Helpful handling for the specific 404 case where a model doesn't support generateContent
+      if (err && err.status === 404) {
+        console.error(`Model '${GEMINI_MODEL}' returned 404 for generateContent.`);
+        // As a fallback, call the public ListModels REST endpoint directly using the API key
+        try {
+          const restEndpoints = [
+            `https://generativelanguage.googleapis.com/v1/models?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`
+          ];
+          const restResults = [];
+          for (const url of restEndpoints) {
+            try {
+              const r = await axios.get(url, { timeout: 5000 });
+              restResults.push({ url, status: r.status, data: r.data });
+            } catch (restErr) {
+              restResults.push({ url, error: restErr.toString() });
+            }
+          }
+
+          console.error('REST ListModels results for debugging:', JSON.stringify(restResults, null, 2));
+
+          return res.status(500).json({
+            error: `Model '${GEMINI_MODEL}' is not available for generateContent. Server logged ListModels output; check server logs.`,
+            listModelsDebug: restResults
+          });
+        } catch (listErr) {
+          console.error('Attempt to call REST ListModels failed:', listErr);
+          return res.status(500).json({
+            error: `Model '${GEMINI_MODEL}' is not available, and listing models via REST failed. Check server logs.`
+          });
+        }
+      }
+
+      // Unknown error; rethrow to be caught by outer catch
+      throw err;
+    }
+
+    // Extract caption text safely
+    let generatedCaption = '';
+    try {
+      if (result?.response && typeof result.response.text === 'function') {
+        generatedCaption = result.response.text();
+      } else if (result?.output && Array.isArray(result.output)) {
+        // SDKs sometimes return structured output arrays
+        generatedCaption = result.output.map(o => o.content || '').join('\n').trim();
+      } else if (typeof result === 'string') {
+        generatedCaption = result;
+      } else {
+        generatedCaption = JSON.stringify(result);
+      }
+    } catch (err) {
+      console.error('Failed to extract text from model result:', err);
+      generatedCaption = '';
+    }
 
     // 3. Trigger Make.com Webhook 🚀
     await axios.post(MAKE_WEBHOOK_URL, {
